@@ -26,6 +26,11 @@ class STTNInpaint:
         self.device = config.device
         # 1. 创建InpaintGenerator模型实例并装载到选择的设备上
         self.model = InpaintGenerator().to(self.device)
+        # 修改FP16判断逻辑
+        if torch.cuda.is_available():
+            self.model = self.model.half()
+            # 启用 cudnn benchmark
+            torch.backends.cudnn.benchmark = True
         # 2. 载入预训练模型的权重，转载模型的状态字典
         self.model.load_state_dict(torch.load(config.STTN_MODEL_PATH, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
@@ -121,7 +126,10 @@ class STTNInpaint:
         # 对帧进行预处理转换为张量，并进行归一化
         feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
         # 把特征张量转移到指定的设备（CPU或GPU）
+        if torch.cuda.is_available():
+            feats = feats.half()
         feats = feats.to(self.device)
+
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
         # 关闭梯度计算，用于推理阶段节省内存并加速
@@ -142,7 +150,41 @@ class STTNInpaint:
             # 同样关闭梯度计算
             with torch.no_grad():
                 # 通过模型推断特征并传递给解码器以生成完成的帧
-                pred_feat = self.model.infer(feats[0, neighbor_ids + ref_ids, :, :, :])
+                # pred_feat = self.model.infer(feats[0, neighbor_ids + ref_ids, :, :, :])
+                # 开启CUDA图优化
+                curr_input = feats[0, neighbor_ids + ref_ids, :, :, :]
+                input_shape = curr_input.shape
+                
+                if self.device == 'cuda':
+                    # 检查是否已有对应形状的CUDA图
+                    if input_shape not in self.graph_pool:
+                        # 为新的输入形状创建CUDA图
+                        static_input = curr_input.clone()
+                        static_output = torch.empty_like(static_input)
+                        s = torch.cuda.Stream()
+                        s.wait_stream(torch.cuda.current_stream())
+                        
+                        with torch.cuda.stream(s):
+                            torch.cuda.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph):
+                                static_output.copy_(self.model.infer(static_input))
+                        
+                        self.graph_pool[input_shape] = {
+                            'graph': graph,
+                            'static_input': static_input,
+                            'static_output': static_output
+                        }
+                        torch.cuda.synchronize()
+                    
+                    # 使用缓存的CUDA图
+                    graph_data = self.graph_pool[input_shape]
+                    graph_data['static_input'].copy_(curr_input)
+                    graph_data['graph'].replay()
+                    pred_feat = graph_data['static_output']
+                else:
+                    # CPU模式下直接计算
+                    pred_feat = self.model.infer(curr_input)
                 # 将预测的特征通过解码器生成图片，并应用激活函数tanh，然后分离出张量
                 pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :])).detach()
                 # 将结果张量重新缩放到0到255的范围内（图像像素值）

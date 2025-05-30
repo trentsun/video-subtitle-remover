@@ -17,7 +17,11 @@ numpy==2.2.5
 protobuf==6.30.2
 av==14.3.0
 einops==0.8.1
-paddleocr==2.10.0
+paddleocr==2.7.3
+paddlepaddle==2.6.0
+paddlepaddle--gpu==2.6.0
 paddle2onnx==1.3.1
 onnxruntime-gpu==1.20.1
-onnxruntime-directml==1.20.1;  sys_platform == 'win32'
+torch==2.6.0
+torchvision>=0.15.0,<0.16.0
+psutil>=5.9.0  # 用于系统资源监控 

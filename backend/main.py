@@ -7,6 +7,15 @@ import threading
 import cv2
 import sys
 from functools import cached_property
+import signal
+from contextlib import contextmanager
+import numpy as np
+import queue
+import concurrent.futures
+import json
+import hashlib
+import time
+import pickle
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +36,33 @@ import time
 from tqdm import tqdm
 
 
+class TimeoutException(Exception):
+    pass
+
+@contextmanager
+def time_limit(seconds):
+    """超时处理上下文管理器"""
+    def signal_handler(signum, frame):
+        raise TimeoutException(f"处理超时（{seconds}秒）")
+    
+    # 仅在非Windows平台设置信号处理器
+    if platform.system() != 'Windows':
+        signal.signal(signal.SIGALRM, signal_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+    else:
+        # Windows不支持SIGALRM，使用线程方式实现超时
+        timer = threading.Timer(seconds, lambda: print(f"警告：处理已超过{seconds}秒，但在Windows上无法强制中断"))
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
+
+
 class SubtitleDetect:
     """
     文本框检测类，用于检测视频帧中是否存在文本框
@@ -39,6 +75,7 @@ class SubtitleDetect:
     @cached_property
     def text_detector(self):
         import paddle
+        # 启用GPU加速
         paddle.disable_signal_handler()
         from paddleocr.tools.infer import utility
         from paddleocr.tools.infer.predict_det import TextDetector
@@ -47,8 +84,22 @@ class SubtitleDetect:
         args = utility.parse_args()
         args.det_algorithm = 'DB'
         args.det_model_dir = self.convertToOnnxModelIfNeeded(config.DET_MODEL_PATH)
-        args.use_onnx=len(config.ONNX_PROVIDERS) > 0
-        args.onnx_providers=config.ONNX_PROVIDERS
+        
+        # 强制使用ONNX加速
+        use_onnx = hasattr(config, 'USE_ONNX') and config.USE_ONNX and len(config.ONNX_PROVIDERS) > 0
+        args.use_onnx = use_onnx
+        
+        # 设置设备 - 如果不使用ONNX则尝试使用CUDA
+        if not use_onnx:
+            args.use_gpu = torch.cuda.is_available()
+            if args.use_gpu:
+                print(f"文本检测使用GPU加速(CUDA)")
+            else:
+                print(f"文本检测使用CPU")
+        else:
+            args.onnx_providers = config.ONNX_PROVIDERS
+            print(f"文本检测使用ONNX加速，提供商: {config.ONNX_PROVIDERS}")
+        
         return TextDetector(args)
 
     def detect_subtitle(self, img):
@@ -78,79 +129,164 @@ class SubtitleDetect:
         return coordinate_list
 
     def find_subtitle_frame_no(self, sub_remover=None):
+        """
+        查找视频中包含字幕的帧号及其坐标
+        使用批处理优化提高GPU利用率和缓存机制
+        """
+        # 1. 尝试从缓存加载
+        cached_results = self._load_cache()
+        if cached_results is not None:
+            # 从缓存加载成功，直接返回
+            if sub_remover:
+                sub_remover.progress_total = 50  # 设置进度为50%
+            return cached_results
+            
+        print('[Processing] 开始查找字幕...')
         video_cap = cv2.VideoCapture(self.video_path)
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
         tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
-        current_frame_no = 0
         subtitle_frame_no_box_dict = {}
-        print('[Processing] start finding subtitles...')
-        while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            # 如果读取视频帧失败（视频读到最后一帧）
-            if not ret:
-                break
-            # 读取视频帧成功
-            current_frame_no += 1
-            dt_boxes, elapse = self.detect_subtitle(frame)
-            coordinate_list = self.get_coordinates(dt_boxes.tolist())
-            if coordinate_list:
-                temp_list = []
-                for coordinate in coordinate_list:
-                    xmin, xmax, ymin, ymax = coordinate
-                    if self.sub_area is not None:
-                        s_ymin, s_ymax, s_xmin, s_xmax = self.sub_area
-                        if (s_xmin <= xmin and xmax <= s_xmax
-                                and s_ymin <= ymin
-                                and ymax <= s_ymax):
+        
+        # 检查是否启用批处理
+        if not hasattr(config, 'SUBTITLE_BATCH_PROCESSING') or not config.SUBTITLE_BATCH_PROCESSING:
+            # 如果禁用批处理，则使用原始单帧处理方式
+            current_frame_no = 0
+            while video_cap.isOpened():
+                ret, frame = video_cap.read()
+                if not ret:
+                    break
+                current_frame_no += 1
+                dt_boxes, _ = self.detect_subtitle(frame)
+                coordinate_list = self.get_coordinates(dt_boxes.tolist() if hasattr(dt_boxes, 'tolist') else [])
+                if coordinate_list:
+                    temp_list = []
+                    for coordinate in coordinate_list:
+                        xmin, xmax, ymin, ymax = coordinate
+                        if self.sub_area is not None:
+                            s_ymin, s_ymax, s_xmin, s_xmax = self.sub_area
+                            if (s_xmin <= xmin and xmax <= s_xmax
+                                    and s_ymin <= ymin
+                                    and ymax <= s_ymax):
+                                temp_list.append((xmin, xmax, ymin, ymax))
+                        else:
                             temp_list.append((xmin, xmax, ymin, ymax))
+                    if len(temp_list) > 0:
+                        subtitle_frame_no_box_dict[current_frame_no] = temp_list
+                tbar.update(1)
+                if sub_remover:
+                    sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
+        else:
+            # 使用批处理模式
+            # 确定批处理大小
+            if hasattr(config, 'SUBTITLE_MAX_BATCH_SIZE') and config.SUBTITLE_MAX_BATCH_SIZE > 0:
+                batch_size = config.SUBTITLE_MAX_BATCH_SIZE
+            else:
+                # 根据可用显存动态调整批处理大小
+                if torch.cuda.is_available():
+                    free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)  # 转换为GB
+                    if free_mem > 8.0:
+                        batch_size = 32
+                    elif free_mem > 4.0:
+                        batch_size = 16
+                    elif free_mem > 2.0:
+                        batch_size = 8
                     else:
-                        temp_list.append((xmin, xmax, ymin, ymax))
-                if len(temp_list) > 0:
-                    subtitle_frame_no_box_dict[current_frame_no] = temp_list
-            tbar.update(1)
-            if sub_remover:
-                sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
+                        batch_size = 4
+                else:
+                    batch_size = 4
+            
+            print(f"字幕查找使用批处理大小: {batch_size}帧")
+            
+            current_frame_no = 0
+            while video_cap.isOpened():
+                frames = []
+                frame_indices = []
+                
+                # 批量读取视频帧
+                for _ in range(batch_size):
+                    ret, frame = video_cap.read()
+                    if not ret:
+                        break
+                    current_frame_no += 1
+                    frames.append(frame)
+                    frame_indices.append(current_frame_no)
+                
+                if not frames:
+                    break  # 没有更多帧可读
+                    
+                # 批量检测字幕
+                batch_results = self.detect_subtitle_batch(frames)
+                
+                # 处理检测结果
+                for i, dt_boxes in enumerate(batch_results):
+                    frame_no = frame_indices[i]
+                    coordinate_list = self.get_coordinates(dt_boxes.tolist() if hasattr(dt_boxes, 'tolist') else [])
+                    
+                    if coordinate_list:
+                        temp_list = []
+                        for coordinate in coordinate_list:
+                            xmin, xmax, ymin, ymax = coordinate
+                            if self.sub_area is not None:
+                                s_ymin, s_ymax, s_xmin, s_xmax = self.sub_area
+                                if (s_xmin <= xmin and xmax <= s_xmax
+                                        and s_ymin <= ymin
+                                        and ymax <= s_ymax):
+                                    temp_list.append((xmin, xmax, ymin, ymax))
+                            else:
+                                temp_list.append((xmin, xmax, ymin, ymax))
+                        if len(temp_list) > 0:
+                            subtitle_frame_no_box_dict[frame_no] = temp_list
+                    
+                    # 更新进度条
+                    tbar.update(1)
+                    if sub_remover:
+                        sub_remover.progress_total = (100 * float(frame_no) / float(frame_count)) // 2
+                        
+                # 清理显存
+                if torch.cuda.is_available() and len(frames) > 0:
+                    torch.cuda.empty_cache()
+        
+        video_cap.release()
         subtitle_frame_no_box_dict = self.unify_regions(subtitle_frame_no_box_dict)
-        # if config.UNITE_COORDINATES:
-        #     subtitle_frame_no_box_dict = self.get_subtitle_frame_no_box_dict_with_united_coordinates(subtitle_frame_no_box_dict)
-        #     if sub_remover is not None:
-        #         try:
-        #             # 当帧数大于1时，说明并非图片或单帧
-        #             if sub_remover.frame_count > 1:
-        #                 subtitle_frame_no_box_dict = self.filter_mistake_sub_area(subtitle_frame_no_box_dict,
-        #                                                                           sub_remover.fps)
-        #         except Exception:
-        #             pass
-        #     subtitle_frame_no_box_dict = self.prevent_missed_detection(subtitle_frame_no_box_dict)
-        print('[Finished] Finished finding subtitles...')
+        print('[Finished] 字幕查找完成...')
+        
+        # 过滤空结果
         new_subtitle_frame_no_box_dict = dict()
         for key in subtitle_frame_no_box_dict.keys():
             if len(subtitle_frame_no_box_dict[key]) > 0:
                 new_subtitle_frame_no_box_dict[key] = subtitle_frame_no_box_dict[key]
+        
+        # 保存缓存
+        self._save_cache(new_subtitle_frame_no_box_dict)
+                
         return new_subtitle_frame_no_box_dict
 
     def convertToOnnxModelIfNeeded(self, model_dir, model_filename="inference.pdmodel", params_filename="inference.pdiparams", opset_version=14):
         """Converts a Paddle model to ONNX if ONNX providers are available and the model does not already exist."""
         
-        if not config.ONNX_PROVIDERS:
+        # 检查是否启用ONNX加速
+        use_onnx = hasattr(config, 'USE_ONNX') and config.USE_ONNX and len(config.ONNX_PROVIDERS) > 0
+        
+        if not use_onnx:
+            print(f"ONNX加速未启用，使用原始Paddle模型: {model_dir}")
             return model_dir
         
         onnx_model_path = os.path.join(model_dir, "model.onnx")
 
         if os.path.exists(onnx_model_path):
-            print(f"ONNX model already exists: {onnx_model_path}. Skipping conversion.")
+            print(f"ONNX模型已存在: {onnx_model_path}，跳过转换。")
             return onnx_model_path
         
-        print(f"Converting Paddle model {model_dir} to ONNX...")
+        print(f"正在将Paddle模型 {model_dir} 转换为ONNX格式...")
         model_file = os.path.join(model_dir, model_filename)
         params_file = os.path.join(model_dir, params_filename) if params_filename else ""
 
         try:
             import paddle2onnx
-            # Ensure the target directory exists
+            # 确保目标目录存在
             os.makedirs(os.path.dirname(onnx_model_path), exist_ok=True)
 
-            # Convert and save the model
+            # 转换保存模型
             onnx_model = paddle2onnx.export(
                 model_filename=model_file,
                 params_filename=params_file,
@@ -168,10 +304,10 @@ class SubtitleDetect:
                 export_fp16_model=False,
             )
 
-            print(f"Conversion successful. ONNX model saved to: {onnx_model_path}")
+            print(f"转换成功。ONNX模型已保存至: {onnx_model_path}")
             return onnx_model_path
         except Exception as e:
-            print(f"Error during conversion: {e}")
+            print(f"转换过程中出错: {e}")
             return model_dir
 
 
@@ -561,6 +697,315 @@ class SubtitleDetect:
             correct_subtitle_frame_no_box_dict[frame_no] = new_box_list
         return correct_subtitle_frame_no_box_dict
 
+    def detect_subtitle_batch(self, frames):
+        """
+        批量检测字幕，利用并行处理和真正的批处理提高GPU利用率
+        Args:
+            frames: numpy array, shape (batch_size, height, width, channels)
+        Returns:
+            list of dt_boxes
+        """
+        try:
+            # 检查是否启用批处理
+            if not hasattr(config, 'SUBTITLE_BATCH_PROCESSING') or not config.SUBTITLE_BATCH_PROCESSING:
+                # 如果禁用批处理，则退回到逐帧处理
+                results = []
+                for frame in frames:
+                    dt_boxes, _ = self.detect_subtitle(frame)
+                    results.append(dt_boxes)
+                return results
+
+            # 确保输入是numpy数组
+            if not isinstance(frames, np.ndarray):
+                frames = np.array(frames)
+                
+            # 获取批处理大小
+            batch_size = len(frames)
+            results = [None] * batch_size  # 预分配结果列表
+            
+            # 根据系统资源确定最佳批处理大小和线程数
+            if torch.cuda.is_available():
+                # 获取可用显存情况并动态调整批处理大小
+                free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)  # 转换为GB
+                
+                # 根据可用显存动态调整批处理大小，除非用户指定了大小
+                if hasattr(config, 'SUBTITLE_MAX_BATCH_SIZE') and config.SUBTITLE_MAX_BATCH_SIZE > 0:
+                    optimal_batch_size = config.SUBTITLE_MAX_BATCH_SIZE
+                else:
+                    # 动态调整批处理大小
+                    if free_mem > 8.0:
+                        optimal_batch_size = 32
+                    elif free_mem > 4.0:
+                        optimal_batch_size = 16
+                    elif free_mem > 2.0:
+                        optimal_batch_size = 8
+                    else:
+                        optimal_batch_size = 4
+                
+                # 线程数量基于CPU核心数，但受限于GPU处理能力
+                if hasattr(config, 'SUBTITLE_MAX_THREADS') and config.SUBTITLE_MAX_THREADS > 0:
+                    num_workers = config.SUBTITLE_MAX_THREADS
+                else:
+                    num_workers = min(4, multiprocessing.cpu_count() // 2)
+                
+                print(f"检测到{free_mem:.2f}GB可用显存，设置批处理大小为{optimal_batch_size}，线程数为{num_workers}")
+            else:
+                # CPU模式下使用较小的批处理大小
+                if hasattr(config, 'SUBTITLE_MAX_BATCH_SIZE') and config.SUBTITLE_MAX_BATCH_SIZE > 0:
+                    optimal_batch_size = config.SUBTITLE_MAX_BATCH_SIZE
+                else:
+                    optimal_batch_size = 4
+                
+                # CPU模式下可以使用更多线程
+                if hasattr(config, 'SUBTITLE_MAX_THREADS') and config.SUBTITLE_MAX_THREADS > 0:
+                    num_workers = config.SUBTITLE_MAX_THREADS
+                else:
+                    num_workers = multiprocessing.cpu_count() - 1 or 1
+                
+                print(f"使用CPU模式，设置批处理大小为{optimal_batch_size}，线程数为{num_workers}")
+            
+            # 优化：先预热模型，避免第一次推理速度慢
+            if batch_size > 0:
+                self.detect_subtitle(frames[0])
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()  # 清理显存
+                
+            # 使用线程池进行并行处理
+            def process_mini_batch(start_idx, end_idx):
+                mini_batch = frames[start_idx:end_idx]
+                mini_results = []
+                
+                # 检查是否支持真正的批处理 (通过PaddleOCR提供的批处理功能)
+                # 以下是批处理尝试的代码：如果原始TextDetector不支持批处理，则退回到单帧处理
+                try:
+                    # 尝试对整个mini batch进行批处理
+                    # 注意：这取决于PaddleOCR的TextDetector是否支持批处理
+                    # 如果支持，这将提高处理速度
+                    all_dt_boxes, _ = self.text_detector(mini_batch)
+                    mini_results = all_dt_boxes
+                except Exception as e:
+                    # 如果批处理不可用，退回到单帧处理
+                    print(f"批处理不可用，退回到单帧处理: {e}")
+                    for frame in mini_batch:
+                        dt_boxes, _ = self.detect_subtitle(frame)
+                        mini_results.append(dt_boxes)
+                
+                return start_idx, mini_results
+                
+            # 使用线程池处理每个小批次
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = []
+                for i in range(0, batch_size, optimal_batch_size):
+                    end_idx = min(i + optimal_batch_size, batch_size)
+                    futures.append(executor.submit(process_mini_batch, i, end_idx))
+                
+                # 收集结果
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        start_idx, mini_results = future.result()
+                        end_idx = min(start_idx + len(mini_results), batch_size)
+                        for j in range(len(mini_results)):
+                            if start_idx + j < batch_size:
+                                results[start_idx + j] = mini_results[j]
+                    except Exception as e:
+                        print(f"处理批次时出错: {e}")
+            
+            # 处理完所有批次后清理显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            # 确保所有结果都有值（处理可能的错误情况）
+            for i in range(batch_size):
+                if results[i] is None:
+                    results[i] = np.array([])
+                    
+            return results
+            
+        except Exception as e:
+            print(f"批处理字幕检测错误: {e}")
+            # 返回空结果以确保不会中断主流程
+            return [np.array([]) for _ in range(len(frames))]
+
+    def _get_cache_hash(self):
+        """
+        计算视频文件和相关参数的哈希值，用于缓存标识
+        """
+        # 如果文件不存在或很大，仅使用文件名、大小和修改时间
+        try:
+            file_stats = os.stat(self.video_path)
+            file_size = file_stats.st_size
+            file_mtime = file_stats.st_mtime
+            
+            # 对于大文件，不计算内容哈希
+            if file_size > 100 * 1024 * 1024:  # 文件大于100MB
+                hash_input = f"{self.video_path}_{file_size}_{file_mtime}_{self.sub_area}"
+                return hashlib.md5(hash_input.encode('utf-8')).hexdigest()
+            
+            # 对于小文件，计算部分内容哈希
+            with open(self.video_path, 'rb') as f:
+                # 读取文件头部和尾部各1MB的内容
+                header = f.read(1024 * 1024)
+                f.seek(max(0, file_size - 1024 * 1024))
+                footer = f.read(1024 * 1024)
+                content_sample = header + footer
+                
+            hash_input = f"{self.video_path}_{file_size}_{file_mtime}_{self.sub_area}_{hashlib.md5(content_sample).hexdigest()}"
+            return hashlib.md5(hash_input.encode('utf-8')).hexdigest()
+            
+        except (FileNotFoundError, IOError):
+            # 如果文件不存在或无法读取，仅使用路径和子区域
+            hash_input = f"{self.video_path}_{self.sub_area}"
+            return hashlib.md5(hash_input.encode('utf-8')).hexdigest()
+    
+    def _get_cache_path(self):
+        """
+        获取缓存文件路径
+        """
+        # 确保缓存目录存在
+        if hasattr(config, 'SUBTITLE_CACHE_DIR') and hasattr(config, 'SUBTITLE_CACHE_PREFIX'):
+            cache_dir = config.SUBTITLE_CACHE_DIR
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            # 生成缓存文件名
+            file_hash = self._get_cache_hash()
+            cache_filename = f"{config.SUBTITLE_CACHE_PREFIX}{file_hash}.pkl"
+            
+            return os.path.join(cache_dir, cache_filename)
+        return None
+    
+    def _save_cache(self, subtitle_data):
+        """
+        保存字幕检测结果到缓存文件
+        
+        Args:
+            subtitle_data: 字幕检测结果数据
+        """
+        if not hasattr(config, 'ENABLE_SUBTITLE_CACHE') or not config.ENABLE_SUBTITLE_CACHE:
+            return
+            
+        cache_path = self._get_cache_path()
+        if not cache_path:
+            return
+            
+        try:
+            # 保存元数据和检测结果
+            cache_data = {
+                'video_path': self.video_path,
+                'sub_area': self.sub_area,
+                'timestamp': time.time(),
+                'subtitle_data': subtitle_data
+            }
+            
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+                
+            print(f"[缓存] 字幕检测结果成功保存到: {cache_path}")
+        except Exception as e:
+            print(f"[警告] 保存字幕检测缓存失败: {e}")
+    
+    def _load_cache(self):
+        """
+        从缓存文件加载字幕检测结果
+        
+        Returns:
+            缓存的字幕检测结果或None（如果没有有效缓存）
+        """
+        if not hasattr(config, 'ENABLE_SUBTITLE_CACHE') or not config.ENABLE_SUBTITLE_CACHE:
+            return None
+            
+        cache_path = self._get_cache_path()
+        if not cache_path or not os.path.exists(cache_path):
+            return None
+            
+        try:
+            # 检查文件是否被修改（如果配置了需要在修改时重新检测）
+            if hasattr(config, 'FORCE_REDETECT_ON_MODIFIED') and config.FORCE_REDETECT_ON_MODIFIED:
+                file_stats = os.stat(self.video_path)
+                file_mtime = file_stats.st_mtime
+                
+                with open(cache_path, 'rb') as f:
+                    cache_data = pickle.load(f)
+                    
+                # 如果文件在缓存后被修改，返回None强制重新检测
+                if file_mtime > cache_data.get('timestamp', 0):
+                    print(f"[缓存] 视频文件已被修改，将重新检测字幕")
+                    return None
+                    
+                print(f"[缓存] 从文件加载字幕检测结果: {cache_path}")
+                return cache_data.get('subtitle_data')
+            else:
+                # 直接加载缓存
+                with open(cache_path, 'rb') as f:
+                    cache_data = pickle.load(f)
+                
+                print(f"[缓存] 从文件加载字幕检测结果: {cache_path}")
+                return cache_data.get('subtitle_data')
+        except Exception as e:
+            print(f"[警告] 加载字幕检测缓存失败: {e}")
+            # 尝试删除可能损坏的缓存文件
+            try:
+                os.remove(cache_path)
+                print(f"[警告] 已删除可能损坏的缓存文件: {cache_path}")
+            except:
+                pass
+            return None
+
+    @staticmethod
+    def clear_cache(video_path=None):
+        """
+        清理字幕检测缓存
+        
+        Args:
+            video_path: 可选，指定视频文件路径，若为None则清理所有缓存
+        
+        Returns:
+            删除的缓存文件数量
+        """
+        if not hasattr(config, 'SUBTITLE_CACHE_DIR'):
+            print("[缓存] 未配置缓存目录，无需清理")
+            return 0
+            
+        cache_dir = config.SUBTITLE_CACHE_DIR
+        if not os.path.exists(cache_dir):
+            print(f"[缓存] 缓存目录不存在: {cache_dir}")
+            return 0
+            
+        # 删除指定视频相关的缓存
+        if video_path:
+            detector = SubtitleDetect(video_path)
+            cache_path = detector._get_cache_path()
+            if cache_path and os.path.exists(cache_path):
+                try:
+                    os.remove(cache_path)
+                    print(f"[缓存] 已清理视频 {video_path} 的缓存")
+                    return 1
+                except Exception as e:
+                    print(f"[警告] 清理缓存失败: {e}")
+                    return 0
+            else:
+                print(f"[缓存] 未找到视频 {video_path} 的缓存")
+                return 0
+                
+        # 清理所有缓存
+        file_count = 0
+        prefix = config.SUBTITLE_CACHE_PREFIX if hasattr(config, 'SUBTITLE_CACHE_PREFIX') else ''
+        try:
+            for filename in os.listdir(cache_dir):
+                if filename.startswith(prefix) and filename.endswith('.pkl'):
+                    cache_file = os.path.join(cache_dir, filename)
+                    os.remove(cache_file)
+                    file_count += 1
+            
+            if file_count > 0:
+                print(f"[缓存] 已清理 {file_count} 个缓存文件")
+            else:
+                print("[缓存] 没有找到可清理的缓存文件")
+                
+            return file_count
+        except Exception as e:
+            print(f"[警告] 清理缓存失败: {e}")
+            return file_count
+
 
 class SubtitleRemover:
     def __init__(self, vd_path, sub_area=None, gui_mode=False):
@@ -679,83 +1124,60 @@ class SubtitleRemover:
         scene_div_points = self.sub_detector.get_scene_div_frame_no(self.video_path)
         continuous_frame_no_list = self.sub_detector.split_range_by_scene(continuous_frame_no_list,
                                                                           scene_div_points)
-        self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM)
-        print('[Processing] start removing subtitles...')
+        
+        # 获取当前可用显存情况
+        available_memory = "未知"
+        if torch.cuda.is_available():
+            free_mem = []
+            for i in range(torch.cuda.device_count()):
+                free_mem.append(torch.cuda.mem_get_info(i)[0] / (1024**3))  # 转换为GB
+            
+            min_free_mem = min(free_mem) if free_mem else 0
+            available_memory = f"{min_free_mem:.2f} GB"
+            print(f"当前可用显存: {available_memory}")
+        
+        # 创建VideoInpaint实例
+        self.video_inpaint = VideoInpaint(sub_video_length=1, high_quality=True)
+        
+        print('[处理] 开始去除字幕...')
+        
         index = 0
         while True:
             ret, frame = self.video_cap.read()
             if not ret:
                 break
             index += 1
-            # 如果当前帧没有水印/文本则直接写
+            # 如果当前帧没有字幕则直接写入
             if index not in sub_list.keys():
                 self.video_writer.write(frame)
-                print(f'write frame: {index}')
+                if index % 20 == 0:  # 减少日志输出频率
+                    print(f'写入无字幕帧: {index}')
                 self.update_progress(tbar, increment=1)
                 continue
-            # 如果有水印，判断该帧是不是开头帧
             else:
-                # 如果是开头帧，则批推理到尾帧
-                if self.is_current_frame_no_start(index, continuous_frame_no_list):
-                    # print(f'No 1 Current index: {index}')
-                    start_frame_no = index
-                    print(f'find start: {start_frame_no}')
-                    # 找到结束帧
-                    end_frame_no = self.find_frame_no_end(index, continuous_frame_no_list)
-                    # 判断当前帧号是不是字幕起始位置
-                    # 如果获取的结束帧号不为-1则说明
-                    if end_frame_no != -1:
-                        print(f'find end: {end_frame_no}')
-                        # ************ 读取该区间所有帧 start ************
-                        temp_frames = list()
-                        # 将头帧加入处理列表
-                        temp_frames.append(frame)
-                        inner_index = 0
-                        # 一直读取到尾帧
-                        while index < end_frame_no:
-                            ret, frame = self.video_cap.read()
-                            if not ret:
-                                break
-                            index += 1
-                            temp_frames.append(frame)
-                        # ************ 读取该区间所有帧 end ************
-                        if len(temp_frames) < 1:
-                            # 没有待处理，直接跳过
-                            continue
-                        elif len(temp_frames) == 1:
-                            inner_index += 1
-                            single_mask = create_mask(self.mask_size, sub_list[index])
-                            if self.lama_inpaint is None:
-                                self.lama_inpaint = LamaInpaint()
-                            inpainted_frame = self.lama_inpaint(frame, single_mask)
-                            self.video_writer.write(inpainted_frame)
-                            print(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
-                            self.update_progress(tbar, increment=1)
-                            continue
-                        else:
-                            # 将读取的视频帧分批处理
-                            # 1. 获取当前批次使用的mask
-                            mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                            for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
-                                # 2. 调用批推理
-                                if len(batch) == 1:
-                                    single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                                    if self.lama_inpaint is None:
-                                        self.lama_inpaint = LamaInpaint()
-                                    inpainted_frame = self.lama_inpaint(frame, single_mask)
-                                    self.video_writer.write(inpainted_frame)
-                                    print(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
-                                    inner_index += 1
-                                    self.update_progress(tbar, increment=1)
-                                elif len(batch) > 1:
-                                    inpainted_frames = self.video_inpaint.inpaint(batch, mask)
-                                    for i, inpainted_frame in enumerate(inpainted_frames):
-                                        self.video_writer.write(inpainted_frame)
-                                        print(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
-                                        inner_index += 1
-                                        if self.gui_mode:
-                                            self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
-                                self.update_progress(tbar, increment=len(batch))
+                # 单帧处理模式：每次只处理一帧
+                mask = create_mask(self.mask_size, sub_list[index])
+                
+                try:
+                    # 清理显存
+                    if torch.cuda.is_available() and index % 10 == 0:
+                        torch.cuda.empty_cache()
+                        
+                    # 使用VideoInpaint处理帧
+                    inpainted_frames = self.video_inpaint.inpaint([frame], mask)
+                    inpainted_frame = inpainted_frames[0]
+                    self.video_writer.write(inpainted_frame)
+                    
+                    if index % 10 == 0:  # 减少日志输出频率
+                        print(f'处理并写入字幕帧: {index}')
+                        
+                    if self.gui_mode:
+                        self.preview_frame = cv2.hconcat([frame, inpainted_frame])
+                except Exception as e:
+                    print(f"处理帧 {index} 时出错: {e}，写入原始帧")
+                    self.video_writer.write(frame)
+                
+                self.update_progress(tbar, increment=1)
 
     def sttn_mode_with_no_detection(self, tbar):
         """
@@ -972,14 +1394,20 @@ class SubtitleRemover:
 
 if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
-    # 1. 提示用户输入视频路径
-    video_path = input(f"Please input video or image file path: ").strip()
-    # 判断视频路径是不是一个目录，是目录的化，批量处理改目录下的所有视频文件
-    # 2. 按以下顺序传入字幕区域
-    # sub_area = (ymin, ymax, xmin, xmax)
-    # 3. 新建字幕提取对象
-    if is_video_or_image(video_path):
-        sd = SubtitleRemover(video_path, sub_area=None)
-        sd.run()
-    else:
-        print(f'Invalid video path: {video_path}')
+    
+    # 处理4.mp4到15.mp4
+    sub_area = (1200, 1700, 0, 1080)
+    
+    for i in range(1, 16):
+        video_path = f"{i}.mp4"
+        print(f"\n正在处理 {video_path}...")
+        
+        if is_video_or_image(video_path):
+            try:
+                sd = SubtitleRemover(video_path, sub_area=sub_area)
+                sd.run()
+                print(f"{video_path} 处理完成")
+            except Exception as e:
+                print(f"{video_path} 处理失败: {str(e)}")
+        else:
+            print(f'无效的视频路径: {video_path}')
