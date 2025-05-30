@@ -1137,7 +1137,7 @@ class SubtitleRemover:
             print(f"当前可用显存: {available_memory}")
         
         # 创建VideoInpaint实例
-        self.video_inpaint = VideoInpaint(sub_video_length=1, high_quality=True)
+        self.video_inpaint = VideoInpaint(sub_video_length=1)
         
         print('[处理] 开始去除字幕...')
         
