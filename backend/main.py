@@ -1159,13 +1159,31 @@ class SubtitleRemover:
                 mask = create_mask(self.mask_size, sub_list[index])
                 
                 try:
+                    # 验证输入帧和掩码的有效性
+                    if frame is None or frame.size == 0:
+                        raise ValueError("输入帧为空或无效")
+                    if mask is None or mask.size == 0:
+                        raise ValueError("掩码为空或无效")
+                        
+                    # 确保帧和掩码维度匹配
+                    if frame.shape[:2] != mask.shape[:2]:
+                        raise ValueError(f"帧尺寸 {frame.shape[:2]} 与掩码尺寸 {mask.shape[:2]} 不匹配")
+                    
                     # 清理显存
                     if torch.cuda.is_available() and index % 10 == 0:
                         torch.cuda.empty_cache()
                         
                     # 使用VideoInpaint处理帧
                     inpainted_frames = self.video_inpaint.inpaint([frame], mask)
+                    
+                    # 验证输出结果
+                    if not inpainted_frames or len(inpainted_frames) == 0:
+                        raise ValueError("修复结果为空")
+                        
                     inpainted_frame = inpainted_frames[0]
+                    if inpainted_frame is None or inpainted_frame.size == 0:
+                        raise ValueError("修复后的帧为空或无效")
+                        
                     self.video_writer.write(inpainted_frame)
                     
                     if index % 10 == 0:  # 减少日志输出频率
@@ -1173,8 +1191,11 @@ class SubtitleRemover:
                         
                     if self.gui_mode:
                         self.preview_frame = cv2.hconcat([frame, inpainted_frame])
+                        
                 except Exception as e:
-                    print(f"处理帧 {index} 时出错: {e}，写入原始帧")
+                    print(f"处理帧 {index} 时出错: {str(e)}，写入原始帧")
+                    print(f"帧信息 - 形状: {frame.shape if frame is not None else 'None'}")
+                    print(f"掩码信息 - 形状: {mask.shape if mask is not None else 'None'}")
                     self.video_writer.write(frame)
                 
                 self.update_progress(tbar, increment=1)
