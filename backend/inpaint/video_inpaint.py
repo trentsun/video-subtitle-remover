@@ -130,15 +130,16 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 
 
 class VideoInpaint:
-    def __init__(self, sub_video_length=config.PROPAINTER_MAX_LOAD_NUM, use_fp16=True):
+    def __init__(self, sub_video_length=config.PROPAINTER_MAX_LOAD_NUM, use_fp16=True, scale_factor=0.5):
         self.device = get_device()
         self.use_fp16 = use_fp16
         self.use_half = True if self.use_fp16 else False
+        self.scale_factor = scale_factor
         if self.device == torch.device('cpu'):
             self.use_half = False
         # Length of sub-video for long video inference.
         self.sub_video_length = sub_video_length
-        # Length of local neighboring frames.'
+        # Length of local neighboring frames
         self.neighbor_length = 10
         # Mask dilation for video and flow masking
         self.mask_dilation = 4
@@ -154,6 +155,20 @@ class VideoInpaint:
         self.fix_flow_complete = self.init_fix_flow_model()
         # 设置inpaint模型
         self.model = self.init_inpaint_model()
+
+    def downsample_frame(self, frame):
+        """下采样一帧图像"""
+        if self.scale_factor == 1.0:
+            return frame
+        h, w = frame.shape[:2]
+        new_size = (int(w * self.scale_factor), int(h * self.scale_factor))
+        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+        
+    def upsample_frame(self, frame, original_size):
+        """上采样一帧图像"""
+        if self.scale_factor == 1.0:
+            return frame
+        return cv2.resize(frame, original_size, interpolation=cv2.INTER_LANCZOS4)
 
     def init_raft_model(self):
         # set up RAFT and flow competition model
@@ -174,13 +189,26 @@ class VideoInpaint:
             self.device).eval()
 
     def inpaint(self, frames, mask):
+        """
+        修改inpaint方法以支持下采样处理
+        """
+        # 获取原始尺寸
+        original_size = frames[0].shape[:2][::-1]  # (width, height)
+        
         if isinstance(frames[0], np.ndarray):
+            # 下采样处理
+            if self.scale_factor != 1.0:
+                frames = [self.downsample_frame(f) for f in frames]
+                mask = cv2.resize(mask, (frames[0].shape[1], frames[0].shape[0]), 
+                                interpolation=cv2.INTER_NEAREST)
+            
             frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
+            
         size = frames[0].size
         frames_len = len(frames)
         flow_masks, masks_dilated = read_mask(mask, frames_len, size,
-                                              flow_mask_dilates=self.mask_dilation,
-                                              mask_dilates=self.mask_dilation)
+                                            flow_mask_dilates=self.mask_dilation,
+                                            mask_dilates=self.mask_dilation)
         w, h = size
         # for saving the masked frames or video
         masked_frame_for_save = []
@@ -346,6 +374,11 @@ class VideoInpaint:
             torch.cuda.empty_cache()
         # save videos frame
         comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) for i in comp_frames]
+        
+        # 在返回结果前上采样
+        if self.scale_factor != 1.0:
+            comp_frames = [self.upsample_frame(f, original_size) for f in comp_frames]
+            
         return comp_frames
 
 

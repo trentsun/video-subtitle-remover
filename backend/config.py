@@ -8,6 +8,7 @@ import platform
 import stat
 from fsplit.filesplit import Filesplit
 import onnxruntime as ort
+import cv2
 
 # 项目版本号
 VERSION = "1.1.1"
@@ -165,4 +166,11 @@ PROPAINTER_MAX_LOAD_NUM = 6
 # 是否开启极速模式，开启后不保证inpaint效果，仅仅对包含文本的区域文本进行去除
 LAMA_SUPER_FAST = False
 # ×××××××××× InpaintMode.LAMA算法设置 end ××××××××××
+
+# 下采样相关配置
+ENABLE_DOWNSAMPLING = True  # 是否启用下采样
+DOWNSAMPLE_SCALE = 0.5     # 下采样比例
+DOWNSAMPLE_METHOD = cv2.INTER_AREA  # 下采样插值方法
+UPSAMPLE_METHOD = cv2.INTER_LANCZOS4  # 上采样插值方法
+
 # ×××××××××××××××××××× [可以改] end ××××××××××××××××××××

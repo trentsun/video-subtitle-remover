@@ -1139,7 +1139,7 @@ class SubtitleRemover:
                     print(f"Adjusted batch size to: {config.PROPAINTER_MAX_LOAD_NUM}")
                 
                 if self.video_inpaint is None:
-                    self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM)
+                    video_inpaint = VideoInpaint(sub_video_length=80, scale_factor=0.5)
                 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1474,7 +1474,7 @@ if __name__ == '__main__':
     sub_area = (1200, 1700, 0, 1080)
     
     # 创建要处理的视频文件列表
-    video_numbers = [1] + list(range(3, 16))  # [1, 3, 4, 5, ..., 15]
+    video_numbers = list(range(10, 16))  # [1, 3, 4, 5, ..., 15]
     
     for i in video_numbers:
         video_path = f"{i}.mp4"
