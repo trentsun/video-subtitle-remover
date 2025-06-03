@@ -26,6 +26,7 @@ from shapely.geometry import Polygon
 import time
 from tqdm import tqdm
 import hashlib
+import pickle
 
 
 class SubtitleDetect:
