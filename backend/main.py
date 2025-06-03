@@ -1141,7 +1141,7 @@ class SubtitleRemover:
                                 self.lama_inpaint = LamaInpaint()
                             inpainted_frame = self.lama_inpaint(frame, single_mask)
                             self.video_writer.write(inpainted_frame)
-                            print(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
+                            print(f'lama write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
                             self.update_progress(tbar, increment=1)
                             continue
                         else:
@@ -1156,14 +1156,14 @@ class SubtitleRemover:
                                         self.lama_inpaint = LamaInpaint()
                                     inpainted_frame = self.lama_inpaint(frame, single_mask)
                                     self.video_writer.write(inpainted_frame)
-                                    print(f'write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
+                                    print(f'lama write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
                                     inner_index += 1
                                     self.update_progress(tbar, increment=1)
                                 elif len(batch) > 1:
                                     inpainted_frames = self.video_inpaint.inpaint(batch, mask)
                                     for i, inpainted_frame in enumerate(inpainted_frames):
                                         self.video_writer.write(inpainted_frame)
-                                        print(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
+                                        print(f'pro write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
                                         inner_index += 1
                                         if self.gui_mode:
                                             self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
