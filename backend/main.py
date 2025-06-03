@@ -1413,7 +1413,7 @@ if __name__ == '__main__':
     # 处理4.mp4到15.mp4
     sub_area = (1200, 1700, 0, 1080)
     
-    for i in range(2, 2):
+    for i in range(2, 3):
         video_path = f"{i}.mp4"
         print(f"\n正在处理 {video_path}...")
         
