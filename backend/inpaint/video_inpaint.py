@@ -177,7 +177,8 @@ class VideoInpaint:
         try:
             # 转换输入格式并确保尺寸正确
             if isinstance(frames[0], np.ndarray):
-                # OpenCV格式转换为PIL格式，不需要旋转，只需要颜色空间转换
+                # 保持OpenCV的BGR格式，但调整尺寸顺序
+                frames_cv = frames
                 frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
             
             # 获取并验证尺寸
@@ -185,6 +186,12 @@ class VideoInpaint:
             frames_len = len(frames)
             
             print(f"处理视频帧，PIL尺寸: {frames[0].size}，帧数: {frames_len}")
+            
+            # 调整掩码尺寸以匹配帧
+            if isinstance(mask, np.ndarray):
+                # 转置掩码以匹配PIL格式
+                mask = cv2.transpose(mask)
+                print(f"转置后掩码尺寸: {mask.shape}")
             
             # 确保尺寸是8的倍数
             if w % 8 != 0 or h % 8 != 0:
@@ -195,12 +202,12 @@ class VideoInpaint:
                 
                 # 调整掩码尺寸
                 if isinstance(mask, np.ndarray):
-                    mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                    mask = cv2.resize(mask, (new_h, new_w), interpolation=cv2.INTER_NEAREST)
                 
                 w, h = new_w, new_h
             
             # 生成掩码
-            flow_masks, masks_dilated = read_mask(mask, frames_len, (w, h),
+            flow_masks, masks_dilated = read_mask(mask, frames_len, (h, w),  # 注意这里尺寸顺序
                                                 flow_mask_dilates=self.mask_dilation,
                                                 mask_dilates=self.mask_dilation)
             
@@ -383,7 +390,7 @@ class VideoInpaint:
             print(f"输入帧信息: 数量={len(frames)}, 尺寸={frames[0].size if frames else 'unknown'}")
             print(f"掩码信息: 形状={mask.shape if isinstance(mask, np.ndarray) else 'unknown'}")
             # 返回原始帧
-            return frames
+            return frames_cv
 
 
 def read_frames(v_path):
