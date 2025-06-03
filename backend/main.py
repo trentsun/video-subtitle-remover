@@ -1110,26 +1110,30 @@ class SubtitleRemover:
                                                                               scene_div_points)
             
             # 2. 分类连续帧和单帧
-            single_frames = []  # 存储单帧的帧号
+            single_frames = set()  # 使用set避免重复
             multi_frames = []   # 存储连续多帧的区间
-            processed_frames = {}  # 存储处理后的帧
+            processed_frames = OrderedDict()  # 使用OrderedDict确保顺序
+            
+            # 初始化帧处理状态字典
+            frame_status = {i: 'unprocessed' for i in range(1, self.frame_count + 1)}
             
             for start_no, end_no in continuous_frame_no_list:
                 if start_no == end_no:
-                    single_frames.append(start_no)
+                    single_frames.add(start_no)
+                    frame_status[start_no] = 'single'
                 else:
                     multi_frames.append((start_no, end_no))
-                
+                    for i in range(start_no, end_no + 1):
+                        frame_status[i] = 'multi'
+            
             print(f'Found {len(single_frames)} single frames and {len(multi_frames)} continuous sequences')
             print('[Processing] start removing subtitles...')
             
             # 3. 先处理连续帧
             if multi_frames:
                 print('[Processing] Processing continuous frames with ProPainter...')
-                # 根据显存大小动态调整批次
                 if torch.cuda.is_available():
-                    total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # 转换为GB
-                    # 如果总显存小于24GB，将批次大小减半
+                    total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                     if total_mem < 24:
                         config.PROPAINTER_MAX_LOAD_NUM = max(2, config.PROPAINTER_MAX_LOAD_NUM // 2)
                     print(f"Adjusted batch size to: {config.PROPAINTER_MAX_LOAD_NUM}")
@@ -1137,94 +1141,81 @@ class SubtitleRemover:
                 if self.video_inpaint is None:
                     self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM)
                 
-                # 在每次大批量处理前清理显存
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                index = 0
-                while True:
-                    ret, frame = self.video_cap.read()
-                    if not ret:
-                        break
-                    index += 1
+                # 读取并处理所有连续帧区间
+                for start_no, end_no in multi_frames:
+                    # 定位到区间起始帧
+                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, start_no - 1)
+                    temp_frames = []
                     
-                    # 检查当前帧是否在连续帧区间内
-                    is_in_multi = False
-                    for start_no, end_no in multi_frames:
-                        if start_no <= index <= end_no:
-                            is_in_multi = True
-                            if index == start_no:  # 连续区间的开始
-                                temp_frames = [frame]
-                                # 读取该区间所有帧
-                                current_index = index
-                                while current_index < end_no:
-                                    ret, frame = self.video_cap.read()
-                                    if not ret:
-                                        break
-                                    current_index += 1
-                                    temp_frames.append(frame)
-                                    
-                                # 处理连续帧
-                                mask = create_mask(self.mask_size, sub_list[start_no])
-                                for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
-                                    if len(batch) > 1:
-                                        inpainted_frames = self.video_inpaint.inpaint(batch, mask)
-                                        for i, inpainted_frame in enumerate(inpainted_frames):
-                                            frame_index = start_no + i
-                                            processed_frames[frame_index] = inpainted_frame.copy()
-                                            if self.gui_mode:
-                                                self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
-                                    self.update_progress(tbar, increment=len(batch))
-                                index = current_index  # 更新外层循环的索引
+                    # 读取该区间所有帧
+                    for i in range(start_no, end_no + 1):
+                        ret, frame = self.video_cap.read()
+                        if not ret:
                             break
+                        temp_frames.append(frame)
                     
-                    # 如果不在连续帧区间内且不是单帧，存储原始帧
-                    if not is_in_multi and index not in single_frames:
-                        processed_frames[index] = frame.copy()
-                        self.update_progress(tbar, increment=1)
+                    # 处理连续帧
+                    mask = create_mask(self.mask_size, sub_list[start_no])
+                    for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
+                        if len(batch) > 1:
+                            inpainted_frames = self.video_inpaint.inpaint(batch, mask)
+                            for i, inpainted_frame in enumerate(inpainted_frames):
+                                frame_index = start_no + i
+                                processed_frames[frame_index] = inpainted_frame.copy()
+                                frame_status[frame_index] = 'processed'
+                                if self.gui_mode:
+                                    self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
+                        else:  # 将单帧加入single_frames集合
+                            frame_index = start_no + len(temp_frames) - len(batch)
+                            single_frames.add(frame_index)
+                            frame_status[frame_index] = 'single'
+                        self.update_progress(tbar, increment=len(batch))
                 
-                # 处理完连续帧后卸载ProPainter模型
-                self.unload_models()
-                
-            # 4. 再处理单帧
-            if single_frames:
-                print('[Processing] Processing single frames with Lama...')
-                # 加载Lama模型
-                if self.lama_inpaint is None:
-                    self.lama_inpaint = LamaInpaint()
-                    
-                # 重新定位到视频开始
-                self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                index = 0
-                
-                while True:
-                    ret, frame = self.video_cap.read()
-                    if not ret:
-                        break
-                    index += 1
-                    
-                    if index in single_frames:
-                        mask = create_mask(self.mask_size, sub_list[index])
-                        inpainted_frame = self.lama_inpaint(frame, mask)
-                        processed_frames[index] = inpainted_frame.copy()
-                        if self.gui_mode:
-                            self.preview_frame = cv2.hconcat([frame, inpainted_frame])
-                    elif index not in processed_frames:  # 如果还没有处理过，存储原始帧
-                        processed_frames[index] = frame.copy()
-                    self.update_progress(tbar, increment=1)
-                
-                # 处理完单帧后卸载Lama模型
                 self.unload_models()
             
-            # 5. 按顺序写入所有帧
+            # 4. 处理所有单帧
+            if single_frames:
+                print('[Processing] Processing single frames with Lama...')
+                if self.lama_inpaint is None:
+                    self.lama_inpaint = LamaInpaint()
+                
+                # 处理所有单帧
+                for frame_no in sorted(single_frames):
+                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no - 1)
+                    ret, frame = self.video_cap.read()
+                    if ret:
+                        mask = create_mask(self.mask_size, sub_list[frame_no])
+                        inpainted_frame = self.lama_inpaint(frame, mask)
+                        processed_frames[frame_no] = inpainted_frame.copy()
+                        frame_status[frame_no] = 'processed'
+                        if self.gui_mode:
+                            self.preview_frame = cv2.hconcat([frame, inpainted_frame])
+                    self.update_progress(tbar, increment=1)
+                
+                self.unload_models()
+            
+            # 5. 读取未处理的普通帧
+            print('[Processing] Reading remaining frames...')
+            for frame_no, status in frame_status.items():
+                if status == 'unprocessed':
+                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no - 1)
+                    ret, frame = self.video_cap.read()
+                    if ret:
+                        processed_frames[frame_no] = frame.copy()
+                        frame_status[frame_no] = 'processed'
+                    self.update_progress(tbar, increment=1)
+            
+            # 6. 按顺序写入所有帧
             print('[Processing] Writing processed frames in order...')
-            for i in range(1, self.frame_count + 1):
-                if i in processed_frames:
-                    self.video_writer.write(processed_frames[i])
-                    # 写入后立即释放内存
-                    del processed_frames[i]
+            for frame_no in range(1, self.frame_count + 1):
+                if frame_no in processed_frames:
+                    self.video_writer.write(processed_frames[frame_no])
+                    del processed_frames[frame_no]  # 立即释放内存
                 else:
-                    print(f"Warning: Frame {i} not found in processed frames")
+                    print(f"Warning: Frame {frame_no} not found in processed frames")
                 
         except Exception as e:
             print(f"Error in propainter_mode: {e}")
