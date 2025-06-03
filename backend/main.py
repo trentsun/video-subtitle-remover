@@ -1144,11 +1144,16 @@ class SubtitleRemover:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
+                # 在处理连续帧之前添加
+                print(f"Processing continuous frames from {start_no} to {end_no}")
+                print(f"Total frames in this sequence: {end_no - start_no + 1}")
+                
                 # 读取并处理所有连续帧区间
                 for start_no, end_no in multi_frames:
                     # 定位到区间起始帧
                     self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, start_no - 1)
                     temp_frames = []
+                    current_frame_count = 0  # 添加计数器
                     
                     # 读取该区间所有帧
                     for i in range(start_no, end_no + 1):
@@ -1156,23 +1161,31 @@ class SubtitleRemover:
                         if not ret:
                             break
                         temp_frames.append(frame)
+                        current_frame_count += 1
                     
                     # 处理连续帧
                     mask = create_mask(self.mask_size, sub_list[start_no])
+                    batch_start_idx = 0  # 添加批次起始索引
+                    
                     for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
                         if len(batch) > 1:
                             inpainted_frames = self.video_inpaint.inpaint(batch, mask)
                             for i, inpainted_frame in enumerate(inpainted_frames):
-                                frame_index = start_no + i
+                                frame_index = start_no + batch_start_idx + i  # 修正帧序号计算
                                 processed_frames[frame_index] = inpainted_frame.copy()
                                 frame_status[frame_index] = 'processed'
                                 if self.gui_mode:
                                     self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
                         else:  # 将单帧加入single_frames集合
-                            frame_index = start_no + len(temp_frames) - len(batch)
+                            frame_index = start_no + batch_start_idx  # 修正单帧的帧序号
                             single_frames.add(frame_index)
                             frame_status[frame_index] = 'single'
+                        
+                        batch_start_idx += len(batch)  # 更新批次起始索引
                         self.update_progress(tbar, increment=len(batch))
+                    
+                    # 在每个批次处理后添加
+                    print(f"Processed batch: frames {start_no + batch_start_idx} to {start_no + batch_start_idx + len(batch) - 1}")
                 
                 self.unload_models()
             
@@ -1216,7 +1229,16 @@ class SubtitleRemover:
                     del processed_frames[frame_no]  # 立即释放内存
                 else:
                     print(f"Warning: Frame {frame_no} not found in processed frames")
-                
+            
+            # 在写入帧之前添加验证
+            unprocessed_frames = []
+            for frame_no in range(1, self.frame_count + 1):
+                if frame_no not in processed_frames:
+                    unprocessed_frames.append(frame_no)
+
+            if unprocessed_frames:
+                print(f"Warning: Found {len(unprocessed_frames)} unprocessed frames: {unprocessed_frames}")
+            
         except Exception as e:
             print(f"Error in propainter_mode: {e}")
             print("Error details:")
