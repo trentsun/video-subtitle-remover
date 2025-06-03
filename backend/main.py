@@ -1031,8 +1031,10 @@ class SubtitleRemover:
         # 视频帧率
         self.fps = self.video_cap.get(cv2.CAP_PROP_FPS)
         # 视频尺寸
-        self.size = (int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        self.mask_size = (int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+        self.size = (int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                    int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))  # (width, height)
+        self.mask_size = (int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                         int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)))  # (height, width) for mask
         self.frame_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         # 创建字幕检测对象
@@ -1159,36 +1161,38 @@ class SubtitleRemover:
                 mask = create_mask(self.mask_size, sub_list[index])
                 
                 try:
-                    # 验证输入帧和掩码的有效性
-                    if frame is None or frame.size == 0:
-                        raise ValueError("输入帧为空或无效")
-                    if mask is None or mask.size == 0:
-                        raise ValueError("掩码为空或无效")
+                    # 验证输入数据
+                    if frame is None or mask is None:
+                        raise ValueError("输入帧或掩码为空")
                         
-                    # 确保帧和掩码维度匹配
-                    if frame.shape[:2] != mask.shape[:2]:
-                        raise ValueError(f"帧尺寸 {frame.shape[:2]} 与掩码尺寸 {mask.shape[:2]} 不匹配")
+                    # 确保帧和掩码的尺寸匹配
+                    frame_h, frame_w = frame.shape[:2]
+                    mask_h, mask_w = mask.shape[:2]
                     
-                    # 清理显存
-                    if torch.cuda.is_available() and index % 10 == 0:
-                        torch.cuda.empty_cache()
-                        
+                    if frame_h != mask_h or frame_w != mask_w:
+                        print(f"警告：帧尺寸 ({frame_h}, {frame_w}) 与掩码尺寸 ({mask_h}, {mask_w}) 不匹配")
+                        # 调整掩码尺寸以匹配帧
+                        mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                    
+                    # 确保掩码是二值图像
+                    if mask.dtype != np.uint8:
+                        mask = (mask * 255).astype(np.uint8)
+                    
+                    # 打印调试信息
+                    print(f"准备处理帧 {index}")
+                    print(f"帧尺寸: {frame.shape}")
+                    print(f"掩码尺寸: {mask.shape}")
+                    print(f"掩码值范围: [{mask.min()}, {mask.max()}]")
+                    
                     # 使用VideoInpaint处理帧
                     inpainted_frames = self.video_inpaint.inpaint([frame], mask)
                     
-                    # 验证输出结果
-                    if not inpainted_frames or len(inpainted_frames) == 0:
+                    if not inpainted_frames:
                         raise ValueError("修复结果为空")
                         
                     inpainted_frame = inpainted_frames[0]
-                    if inpainted_frame is None or inpainted_frame.size == 0:
-                        raise ValueError("修复后的帧为空或无效")
-                        
                     self.video_writer.write(inpainted_frame)
                     
-                    if index % 10 == 0:  # 减少日志输出频率
-                        print(f'处理并写入字幕帧: {index}')
-                        
                     if self.gui_mode:
                         self.preview_frame = cv2.hconcat([frame, inpainted_frame])
                         
