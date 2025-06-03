@@ -104,7 +104,7 @@ MODE可选算法类型
 - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
 """
 # 【设置inpaint算法】
-MODE = InpaintMode.STTN
+MODE = InpaintMode.PROPAINTER
 # 【设置像素点偏差】
 # 用于判断是不是非字幕区域(一般认为字幕文本框的长度是要大于宽度的，如果字幕框的高大于宽，且大于的幅度超过指定像素点大小，则认为是错误检测)
 THRESHOLD_HEIGHT_WIDTH_DIFFERENCE = 10
