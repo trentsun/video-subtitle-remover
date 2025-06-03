@@ -1217,6 +1217,15 @@ class SubtitleRemover:
                 
         except Exception as e:
             print(f"Error in propainter_mode: {e}")
+            print("Error details:")
+            import traceback
+            traceback.print_exc()  # 打印完整的错误堆栈
+            
+            # 打印当前显存使用情况
+            if torch.cuda.is_available():
+                print("\nCUDA Memory Summary:")
+                print(torch.cuda.memory_summary())
+            
             self.unload_models()
             raise
         finally:
