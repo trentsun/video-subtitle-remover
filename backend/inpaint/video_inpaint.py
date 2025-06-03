@@ -188,20 +188,26 @@ class VideoInpaint:
         return InpaintGenerator(model_path=os.path.join(config.VIDEO_INPAINT_MODEL_PATH, 'ProPainter.pth')).to(
             self.device).eval()
 
-    def inpaint(self, frames, mask):
-        """
-        修改inpaint方法以支持下采样处理
-        """
-        # 获取原始尺寸
-        original_size = frames[0].shape[:2][::-1]  # (width, height)
-        
+    def process_batch(self, frames, mask, batch_size=2):
+        """处理一批帧，确保批大小合适"""
+        if len(frames) <= batch_size:
+            return self.process_single_batch(frames, mask)
+            
+        results = []
+        for i in range(0, len(frames), batch_size):
+            batch_frames = frames[i:i + batch_size]
+            batch_results = self.process_single_batch(batch_frames, mask)
+            results.extend(batch_results)
+        return results
+
+    def process_single_batch(self, frames, mask):
+        """处理单个批次的帧"""
         if isinstance(frames[0], np.ndarray):
             # 下采样处理
             if self.scale_factor != 1.0:
                 frames = [self.downsample_frame(f) for f in frames]
                 mask = cv2.resize(mask, (frames[0].shape[1], frames[0].shape[0]), 
                                 interpolation=cv2.INTER_NEAREST)
-            
             frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
             
         size = frames[0].size
@@ -209,177 +215,72 @@ class VideoInpaint:
         flow_masks, masks_dilated = read_mask(mask, frames_len, size,
                                             flow_mask_dilates=self.mask_dilation,
                                             mask_dilates=self.mask_dilation)
-        w, h = size
-        # for saving the masked frames or video
-        masked_frame_for_save = []
-        for i in range(len(frames)):
-            mask_ = np.expand_dims(np.array(masks_dilated[i]), 2).repeat(3, axis=2) / 255.
-            img = np.array(frames[i])
-            green = np.zeros([h, w, 3])
-            green[:, :, 1] = 255
-            alpha = 0.6
-            # alpha = 1.0
-            fuse_img = (1 - alpha) * img + alpha * green
-            fuse_img = mask_ * fuse_img + (1 - mask_) * img
-            masked_frame_for_save.append(fuse_img.astype(np.uint8))
-
+        
         frames_inp = [np.array(f).astype(np.uint8) for f in frames]
         frames = to_tensors()(frames).unsqueeze(0) * 2 - 1
         flow_masks = to_tensors()(flow_masks).unsqueeze(0)
         masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-        frames, flow_masks, masks_dilated = frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(
-            self.device)
-        video_length = frames.size(1)
+        
+        frames = frames.to(self.device)
+        flow_masks = flow_masks.to(self.device)
+        masks_dilated = masks_dilated.to(self.device)
+        
         with torch.no_grad():
-            # ---- compute flow ----
-            if frames.size(-1) <= 640:
-                short_clip_len = 12
-            elif frames.size(-1) <= 720:
-                short_clip_len = 8
-            elif frames.size(-1) <= 1280:
-                short_clip_len = 4
-            else:
-                short_clip_len = 2
-
-            # use fp32 for RAFT
-            if frames.size(1) > short_clip_len:
-                gt_flows_f_list, gt_flows_b_list = [], []
-                for f in range(0, video_length, short_clip_len):
-                    end_f = min(video_length, f + short_clip_len)
-                    if f == 0:
-                        flows_f, flows_b = self.fix_raft(frames[:, f:end_f], iters=self.raft_iter)
-                    else:
-                        flows_f, flows_b = self.fix_raft(frames[:, f - 1:end_f], iters=self.raft_iter)
-                    gt_flows_f_list.append(flows_f)
-                    gt_flows_b_list.append(flows_b)
-                    torch.cuda.empty_cache()
-                gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
-                gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
-                gt_flows_bi = (gt_flows_f, gt_flows_b)
-            else:
+            try:
+                # 计算光流
                 gt_flows_bi = self.fix_raft(frames, iters=self.raft_iter)
-                torch.cuda.empty_cache()
-
-            if self.use_half:
-                frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
-                gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-                fix_flow_complete = self.fix_flow_complete.half()
-                self.model = self.model.half()
-
-            # ---- complete flow ----
-            flow_length = gt_flows_bi[0].size(1)
-            if flow_length > self.sub_video_length:
-                pred_flows_f, pred_flows_b = [], []
-                pad_len = 5
-                for f in range(0, flow_length, self.sub_video_length):
-                    s_f = max(0, f - pad_len)
-                    e_f = min(flow_length, f + self.sub_video_length + pad_len)
-                    pad_len_s = max(0, f) - s_f
-                    pad_len_e = e_f - min(flow_length, f + self.sub_video_length)
-                    pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
-                        (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
-                        flow_masks[:, s_f:e_f + 1])
-                    pred_flows_bi_sub = fix_flow_complete.combine_flow(
-                        (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]),
-                        pred_flows_bi_sub,
-                        flow_masks[:, s_f:e_f + 1])
-
-                    pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
-                    pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
-                    torch.cuda.empty_cache()
-
-                pred_flows_f = torch.cat(pred_flows_f, dim=1)
-                pred_flows_b = torch.cat(pred_flows_b, dim=1)
-                pred_flows_bi = (pred_flows_f, pred_flows_b)
-            else:
-                pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
-                pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
-                torch.cuda.empty_cache()
-
-            # ---- image propagation ----
-            masked_frames = frames * (1 - masks_dilated)
-            # ensure a minimum of 100 frames for image propagation
-            subvideo_length_img_prop = min(100, self.sub_video_length)
-            if video_length > subvideo_length_img_prop:
-                updated_frames, updated_masks = [], []
-                pad_len = 10
-                for f in range(0, video_length, subvideo_length_img_prop):
-                    s_f = max(0, f - pad_len)
-                    e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
-                    pad_len_s = max(0, f) - s_f
-                    pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
-
-                    b, t, _, _, _ = masks_dilated[:, s_f:e_f].size()
-                    pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f - 1], pred_flows_bi[1][:, s_f:e_f - 1])
-                    prop_imgs_sub, updated_local_masks_sub = self.model.img_propagation(masked_frames[:, s_f:e_f],
-                                                                                        pred_flows_bi_sub,
-                                                                                        masks_dilated[:, s_f:e_f],
-                                                                                        'nearest')
-                    updated_frames_sub = frames[:, s_f:e_f] * (1 - masks_dilated[:, s_f:e_f]) + prop_imgs_sub.view(b, t, 3, h, w) * masks_dilated[:, s_f:e_f]
-                    updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
-                    updated_frames.append(updated_frames_sub[:, pad_len_s:e_f - s_f - pad_len_e])
-                    updated_masks.append(updated_masks_sub[:, pad_len_s:e_f - s_f - pad_len_e])
-                    torch.cuda.empty_cache()
-
-                updated_frames = torch.cat(updated_frames, dim=1)
-                updated_masks = torch.cat(updated_masks, dim=1)
-            else:
-                b, t, _, _, _ = masks_dilated.size()
-                prop_imgs, updated_local_masks = self.model.img_propagation(masked_frames, pred_flows_bi, masks_dilated,
-                                                                       'nearest')
+                
+                # 完成光流
+                pred_flows_bi, _ = self.fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
+                pred_flows_bi = self.fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
+                
+                # 图像传播
+                masked_frames = frames * (1 - masks_dilated)
+                prop_imgs, updated_local_masks = self.model.img_propagation(masked_frames, pred_flows_bi, masks_dilated, 'nearest')
+                b, t, _, h, w = masks_dilated.size()
                 updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
                 updated_masks = updated_local_masks.view(b, t, 1, h, w)
-                torch.cuda.empty_cache()
+                
+                # 处理结果
+                comp_frames = []
+                for i in range(frames_len):
+                    frame = updated_frames[0, i].cpu().permute(1, 2, 0).numpy()
+                    frame = (frame + 1) / 2 * 255
+                    frame = frame.astype(np.uint8)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    
+                    # 上采样回原始尺寸
+                    if self.scale_factor != 1.0:
+                        frame = self.upsample_frame(frame, (size[0], size[1]))
+                        
+                    comp_frames.append(frame)
+                
+                return comp_frames
+                
+            except RuntimeError as e:
+                print(f"Error processing batch: {str(e)}")
+                # 如果批处理失败，尝试减小批大小重试
+                if len(frames) > 1:
+                    print("Retrying with smaller batch size...")
+                    half = len(frames) // 2
+                    first_half = self.process_single_batch(frames[:half], mask)
+                    second_half = self.process_single_batch(frames[half:], mask)
+                    return first_half + second_half
+                else:
+                    raise e
 
-        ori_frames = frames_inp
-        comp_frames = [None] * video_length
-
-        neighbor_stride = self.neighbor_length // 2
-        if video_length > self.sub_video_length:
-            ref_num = self.sub_video_length // self.ref_stride
+    def inpaint(self, frames, mask):
+        """
+        修改后的inpaint方法，使用批处理来处理帧
+        """
+        # 确定合适的批大小
+        if len(frames) > self.sub_video_length:
+            batch_size = self.sub_video_length
         else:
-            ref_num = -1
-
-        # ---- feature propagation + transformer ----
-        for f in range(0, video_length, neighbor_stride):
-            neighbor_ids = [
-                i for i in range(max(0, f - neighbor_stride),
-                                 min(video_length, f + neighbor_stride + 1))
-            ]
-            ref_ids = get_ref_index(f, neighbor_ids, video_length, self.ref_stride, ref_num)
-            selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
-            selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :]
-            selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
-            selected_pred_flows_bi = (
-                pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :], pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :])
-
-            with torch.no_grad():
-                # 1.0 indicates mask
-                l_t = len(neighbor_ids)
-                pred_img = self.model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t)
-                pred_img = pred_img.view(-1, 3, h, w)
-                pred_img = (pred_img + 1) / 2
-                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
-                binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(
-                    0, 2, 3, 1).numpy().astype(np.uint8)
-                for i in range(len(neighbor_ids)):
-                    idx = neighbor_ids[i]
-                    img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
-                          + ori_frames[idx] * (1 - binary_masks[i])
-                    if comp_frames[idx] is None:
-                        comp_frames[idx] = img
-                    else:
-                        comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
-                    comp_frames[idx] = comp_frames[idx].astype(np.uint8)
-            torch.cuda.empty_cache()
-        # save videos frame
-        comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) for i in comp_frames]
-        
-        # 在返回结果前上采样
-        if self.scale_factor != 1.0:
-            comp_frames = [self.upsample_frame(f, original_size) for f in comp_frames]
+            batch_size = min(len(frames), 2)  # 默认使用较小的批大小
             
-        return comp_frames
+        print(f"Processing {len(frames)} frames with batch size {batch_size}")
+        return self.process_batch(frames, mask, batch_size)
 
 
 def read_frames(v_path):
