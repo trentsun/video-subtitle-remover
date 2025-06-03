@@ -1149,6 +1149,7 @@ class SubtitleRemover:
                             # 1. 获取当前批次使用的mask
                             mask = create_mask(self.mask_size, sub_list[start_frame_no])
                             for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
+                                print(f"batch size: {len(batch)}")
                                 # 2. 调用批推理
                                 if len(batch) == 1:
                                     single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
