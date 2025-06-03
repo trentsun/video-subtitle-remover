@@ -1470,10 +1470,13 @@ class SubtitleRemover:
 if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
     
-    # 处理4.mp4到15.mp4
+    # 处理1.mp4和3-15.mp4
     sub_area = (1200, 1700, 0, 1080)
     
-    for i in range(2, 3):
+    # 创建要处理的视频文件列表
+    video_numbers = [1] + list(range(3, 16))  # [1, 3, 4, 5, ..., 15]
+    
+    for i in video_numbers:
         video_path = f"{i}.mp4"
         print(f"\n正在处理 {video_path}...")
         
