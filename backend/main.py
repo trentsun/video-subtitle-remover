@@ -1101,92 +1101,120 @@ class SubtitleRemover:
 
     def propainter_mode(self, tbar):
         try:
-            print('use propainter mode')
+            print('use propainter mode with optimized sequence')
+            # 1. 获取所有需要处理的帧信息
             sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
             continuous_frame_no_list = self.sub_detector.find_continuous_ranges_with_same_mask(sub_list)
             scene_div_points = self.sub_detector.get_scene_div_frame_no(self.video_path)
             continuous_frame_no_list = self.sub_detector.split_range_by_scene(continuous_frame_no_list,
                                                                               scene_div_points)
-            print('[Processing] start removing subtitles...')
-            index = 0
-            while True:
-                ret, frame = self.video_cap.read()
-                if not ret:
-                    break
-                index += 1
-                # 如果当前帧没有水印/文本则直接写
-                if index not in sub_list.keys():
-                    self.video_writer.write(frame)
-                    print(f'write frame: {index}')
-                    self.update_progress(tbar, increment=1)
-                    continue
-                # 如果有水印，判断该帧是不是开头帧
+            
+            # 2. 分类连续帧和单帧
+            single_frames = []  # 存储单帧的帧号
+            multi_frames = []   # 存储连续多帧的区间
+            processed_frames = {}  # 存储处理后的帧
+            
+            for start_no, end_no in continuous_frame_no_list:
+                if start_no == end_no:
+                    single_frames.append(start_no)
                 else:
-                    # 如果是开头帧，则批推理到尾帧
-                    if self.is_current_frame_no_start(index, continuous_frame_no_list):
-                        start_frame_no = index
-                        print(f'find start: {start_frame_no}')
-                        # 找到结束帧
-                        end_frame_no = self.find_frame_no_end(index, continuous_frame_no_list)
-                        # 如果获取的结束帧号不为-1则说明
-                        if end_frame_no != -1:
-                            print(f'find end: {end_frame_no}')
-                            # 读取该区间所有帧
-                            temp_frames = [frame]
-                            inner_index = 0
-                            while index < end_frame_no:
-                                ret, frame = self.video_cap.read()
-                                if not ret:
-                                    break
-                                index += 1
-                                temp_frames.append(frame)
-                            
-                            if len(temp_frames) < 1:
-                                continue
-                            elif len(temp_frames) == 1:
-                                inner_index += 1
-                                single_mask = create_mask(self.mask_size, sub_list[index])
-                                # 加载Lama模型
-                                if self.lama_inpaint is None:
-                                    self.lama_inpaint = LamaInpaint()
-                                inpainted_frame = self.lama_inpaint(frame, single_mask)
-                                self.video_writer.write(inpainted_frame)
-                                # 卸载Lama模型
-                                self.unload_models()
-                                print(f'lama write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
-                                self.update_progress(tbar, increment=1)
-                                continue
-                            else:
-                                # 获取当前批次使用的mask
-                                mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                    multi_frames.append((start_no, end_no))
+                
+            print(f'Found {len(single_frames)} single frames and {len(multi_frames)} continuous sequences')
+            print('[Processing] start removing subtitles...')
+            
+            # 3. 先处理连续帧
+            if multi_frames:
+                print('[Processing] Processing continuous frames with ProPainter...')
+                # 加载ProPainter模型
+                if self.video_inpaint is None:
+                    self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM)
+                    
+                index = 0
+                while True:
+                    ret, frame = self.video_cap.read()
+                    if not ret:
+                        break
+                    index += 1
+                    
+                    # 检查当前帧是否在连续帧区间内
+                    is_in_multi = False
+                    for start_no, end_no in multi_frames:
+                        if start_no <= index <= end_no:
+                            is_in_multi = True
+                            if index == start_no:  # 连续区间的开始
+                                temp_frames = [frame]
+                                # 读取该区间所有帧
+                                current_index = index
+                                while current_index < end_no:
+                                    ret, frame = self.video_cap.read()
+                                    if not ret:
+                                        break
+                                    current_index += 1
+                                    temp_frames.append(frame)
+                                    
+                                # 处理连续帧
+                                mask = create_mask(self.mask_size, sub_list[start_no])
                                 for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
-                                    print(f"batch size: {len(batch)}")
-                                    if len(batch) == 1:
-                                        single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                                        # 加载Lama模型
-                                        if self.lama_inpaint is None:
-                                            self.lama_inpaint = LamaInpaint()
-                                        inpainted_frame = self.lama_inpaint(frame, single_mask)
-                                        self.video_writer.write(inpainted_frame)
-                                        # 卸载Lama模型
-                                        self.unload_models()
-                                        print(f'lama write frame: {start_frame_no + inner_index} with mask {sub_list[start_frame_no]}')
-                                        inner_index += 1
-                                        self.update_progress(tbar, increment=1)
-                                    elif len(batch) > 1:
-                                        # 加载ProPainter模型
-                                        if self.video_inpaint is None:
-                                            self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM)
+                                    if len(batch) > 1:
                                         inpainted_frames = self.video_inpaint.inpaint(batch, mask)
-                                        # 卸载ProPainter模型
-                                        self.unload_models()
                                         for i, inpainted_frame in enumerate(inpainted_frames):
-                                            self.video_writer.write(inpainted_frame)
-                                            print(f'pro write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
-                                            inner_index += 1
+                                            frame_index = start_no + i
+                                            processed_frames[frame_index] = inpainted_frame.copy()
                                             if self.gui_mode:
                                                 self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
                                     self.update_progress(tbar, increment=len(batch))
+                                index = current_index  # 更新外层循环的索引
+                            break
+                    
+                    # 如果不在连续帧区间内且不是单帧，存储原始帧
+                    if not is_in_multi and index not in single_frames:
+                        processed_frames[index] = frame.copy()
+                        self.update_progress(tbar, increment=1)
+                
+                # 处理完连续帧后卸载ProPainter模型
+                self.unload_models()
+                
+            # 4. 再处理单帧
+            if single_frames:
+                print('[Processing] Processing single frames with Lama...')
+                # 加载Lama模型
+                if self.lama_inpaint is None:
+                    self.lama_inpaint = LamaInpaint()
+                    
+                # 重新定位到视频开始
+                self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                index = 0
+                
+                while True:
+                    ret, frame = self.video_cap.read()
+                    if not ret:
+                        break
+                    index += 1
+                    
+                    if index in single_frames:
+                        mask = create_mask(self.mask_size, sub_list[index])
+                        inpainted_frame = self.lama_inpaint(frame, mask)
+                        processed_frames[index] = inpainted_frame.copy()
+                        if self.gui_mode:
+                            self.preview_frame = cv2.hconcat([frame, inpainted_frame])
+                    elif index not in processed_frames:  # 如果还没有处理过，存储原始帧
+                        processed_frames[index] = frame.copy()
+                    self.update_progress(tbar, increment=1)
+                
+                # 处理完单帧后卸载Lama模型
+                self.unload_models()
+            
+            # 5. 按顺序写入所有帧
+            print('[Processing] Writing processed frames in order...')
+            for i in range(1, self.frame_count + 1):
+                if i in processed_frames:
+                    self.video_writer.write(processed_frames[i])
+                    # 写入后立即释放内存
+                    del processed_frames[i]
+                else:
+                    print(f"Warning: Frame {i} not found in processed frames")
+                
         except Exception as e:
             print(f"Error in propainter_mode: {e}")
             self.unload_models()
