@@ -1126,10 +1126,21 @@ class SubtitleRemover:
             # 3. 先处理连续帧
             if multi_frames:
                 print('[Processing] Processing continuous frames with ProPainter...')
-                # 加载ProPainter模型
+                # 根据显存大小动态调整批次
+                if torch.cuda.is_available():
+                    total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # 转换为GB
+                    # 如果总显存小于24GB，将批次大小减半
+                    if total_mem < 24:
+                        config.PROPAINTER_MAX_LOAD_NUM = max(2, config.PROPAINTER_MAX_LOAD_NUM // 2)
+                    print(f"Adjusted batch size to: {config.PROPAINTER_MAX_LOAD_NUM}")
+                
                 if self.video_inpaint is None:
                     self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM)
-                    
+                
+                # 在每次大批量处理前清理显存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 index = 0
                 while True:
                     ret, frame = self.video_cap.read()
@@ -1219,9 +1230,8 @@ class SubtitleRemover:
             print(f"Error in propainter_mode: {e}")
             print("Error details:")
             import traceback
-            traceback.print_exc()  # 打印完整的错误堆栈
+            traceback.print_exc()
             
-            # 打印当前显存使用情况
             if torch.cuda.is_available():
                 print("\nCUDA Memory Summary:")
                 print(torch.cuda.memory_summary())
