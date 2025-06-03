@@ -1139,17 +1139,19 @@ class SubtitleRemover:
                     print(f"Adjusted batch size to: {config.PROPAINTER_MAX_LOAD_NUM}")
                 
                 if self.video_inpaint is None:
-                    video_inpaint = VideoInpaint(sub_video_length=80, scale_factor=0.5)
+                    self.video_inpaint = VideoInpaint(config.PROPAINTER_MAX_LOAD_NUM, scale_factor=config.DOWNSAMPLE_SCALE)
                 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
                 # 在处理连续帧之前添加
-                print(f"Processing continuous frames from {start_no} to {end_no}")
-                print(f"Total frames in this sequence: {end_no - start_no + 1}")
+                print(f"Processing continuous frames with scale factor: {config.DOWNSAMPLE_SCALE}")
                 
                 # 读取并处理所有连续帧区间
                 for start_no, end_no in multi_frames:
+                    print(f"Processing continuous frames from {start_no} to {end_no}")
+                    print(f"Total frames in this sequence: {end_no - start_no + 1}")
+                    
                     # 定位到区间起始帧
                     self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, start_no - 1)
                     temp_frames = []
