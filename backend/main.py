@@ -25,6 +25,7 @@ import multiprocessing
 from shapely.geometry import Polygon
 import time
 from tqdm import tqdm
+import hashlib
 
 
 class SubtitleDetect:
