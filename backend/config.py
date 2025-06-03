@@ -115,6 +115,12 @@ THRESHOLD_HEIGHT_DIFFERENCE = 20
 # 用于判断两个字幕文本的矩形框是否相似，如果X轴和Y轴偏差都在指定阈值内，则认为时同一个文本框
 PIXEL_TOLERANCE_Y = 20  # 允许检测框纵向偏差的像素点数
 PIXEL_TOLERANCE_X = 20  # 允许检测框横向偏差的像素点数
+# 是否启用字幕检测结果缓存
+ENABLE_SUBTITLE_CACHE = True
+# 字幕检测结果缓存目录
+SUBTITLE_CACHE_DIR = os.path.join(os.path.dirname(BASE_DIR), '.subtitle_cache')
+# 缓存文件名前缀
+SUBTITLE_CACHE_PREFIX = 'subtitle_detection_'
 # ×××××××××× 通用设置 end ××××××××××
 
 # ×××××××××× InpaintMode.STTN算法设置 start ××××××××××
@@ -152,7 +158,7 @@ if STTN_MAX_LOAD_NUM < STTN_REFERENCE_LENGTH * STTN_NEIGHBOR_STRIDE:
 # 【根据自己的GPU显存大小设置】最大同时处理的图片数量，设置越大处理效果越好，但是要求显存越高
 # 1280x720p视频设置80需要25G显存，设置50需要19G显存
 # 720x480p视频设置80需要8G显存，设置50需要7G显存
-PROPAINTER_MAX_LOAD_NUM = 25
+PROPAINTER_MAX_LOAD_NUM = 1
 # ×××××××××× InpaintMode.PROPAINTER算法设置 end ××××××××××
 
 # ×××××××××× InpaintMode.LAMA算法设置 start ××××××××××
